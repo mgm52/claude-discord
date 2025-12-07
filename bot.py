@@ -2,8 +2,10 @@ import os
 import json
 import asyncio
 import base64
+import aiofiles
 import httpx
 from datetime import datetime
+
 import discord
 import anthropic
 from dotenv import load_dotenv
@@ -19,36 +21,132 @@ channel_debounce_tasks = {}  # channel_id -> asyncio.Task for debounce
 DEBOUNCE_SECONDS = 3  # Wait this long collecting messages before processing
 OUTPUT_NON_MESSAGES = False  # Set to True to show thoughts, web search/fetch, and memory tool usage
 
+# Rate limiting for Claude API calls
+RATE_LIMIT_CALLS = 3  # Max calls per window
+RATE_LIMIT_WINDOW = 45  # Window in seconds
+api_call_timestamps = []  # Timestamps of recent API calls
+rate_limit_queue = {}  # channel_id -> channel - most recent queued request per channel
+rate_limit_process_task = None  # Task for processing queued requests when rate limit clears
+
 # Per-channel check-in mechanism (Claude periodically checks back on the channel)
 channel_checkin_tasks = {}  # channel_id -> asyncio.Task for periodic check-in
 channel_checkin_delay = {}  # channel_id -> current delay in seconds
-CHECKIN_BASE_DELAY = 120  # Initial check-in delay (2 minutes)
-CHECKIN_MULTIPLIER = 3  # Multiply delay by this after each check-in
+CHECKIN_BASE_DELAY = 60  # Initial check-in delay (1 minute)
+CHECKIN_MULTIPLIER = 10  # Multiply delay by this after each check-in
+
+# Per-guild locks for memory file operations (prevents race conditions)
+memory_locks = {}  # guild_id -> asyncio.Lock
+
+# HTTP client settings
+HTTP_TIMEOUT = 30  # seconds
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB max for image downloads
+
+# Reusable HTTP client (created lazily)
+_http_client = None
+
+def get_http_client():
+    """Get or create the shared HTTP client."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True)
+    return _http_client
+
+
+def prune_old_timestamps():
+    """Remove timestamps older than the rate limit window."""
+    global api_call_timestamps
+    cutoff = datetime.now().timestamp() - RATE_LIMIT_WINDOW
+    api_call_timestamps = [ts for ts in api_call_timestamps if ts > cutoff]
+
+
+def can_make_api_call():
+    """Check if we can make an API call within rate limits."""
+    prune_old_timestamps()
+    return len(api_call_timestamps) < RATE_LIMIT_CALLS
+
+
+def record_api_call():
+    """Record that an API call was made."""
+    api_call_timestamps.append(datetime.now().timestamp())
+
+
+def time_until_rate_limit_clears():
+    """Return seconds until the oldest call falls outside the window (so we can make a new call)."""
+    prune_old_timestamps()
+    if len(api_call_timestamps) < RATE_LIMIT_CALLS:
+        return 0
+    oldest = min(api_call_timestamps)
+    time_remaining = (oldest + RATE_LIMIT_WINDOW) - datetime.now().timestamp()
+    return max(0, time_remaining)
+
+
+async def schedule_rate_limit_queue_processing():
+    """Schedule processing of queued requests when rate limit clears."""
+    global rate_limit_process_task
+
+    # If there's already a task running, let it handle things
+    if rate_limit_process_task and not rate_limit_process_task.done():
+        return
+
+    async def process_queue():
+        while rate_limit_queue:
+            wait_time = time_until_rate_limit_clears()
+            if wait_time > 0:
+                await asyncio.sleep(wait_time + 0.1)  # Small buffer
+
+            if not can_make_api_call():
+                continue  # Recheck in case of race
+
+            if not rate_limit_queue:
+                break
+
+            # Pop one channel from the queue and process it
+            channel_id, channel = rate_limit_queue.popitem()
+
+            # Get lock for this channel
+            lock = channel_locks.setdefault(channel_id, asyncio.Lock())
+
+            if lock.locked():
+                # Channel is busy, re-queue it
+                rate_limit_queue[channel_id] = channel
+                continue
+
+            async with lock:
+                await process_channel(channel)
+
+    rate_limit_process_task = asyncio.create_task(process_queue())
 
 def get_memory_path(guild_id):
     """Get the memory file path for a specific server."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     return os.path.join(MEMORY_DIR, f"{guild_id}.md")
 
-def read_memory(guild_id):
-    """Read the memory file for a server if it exists."""
-    try:
-        with open(get_memory_path(guild_id), "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
+def get_memory_lock(guild_id):
+    """Get or create a lock for a guild's memory file."""
+    return memory_locks.setdefault(guild_id, asyncio.Lock())
 
-def write_memory(guild_id, content):
-    """Write content to the memory file for a server."""
-    with open(get_memory_path(guild_id), "w", encoding="utf-8") as f:
-        f.write(content)
+async def read_memory(guild_id):
+    """Read the memory file for a server if it exists (async, with lock)."""
+    async with get_memory_lock(guild_id):
+        try:
+            async with aiofiles.open(get_memory_path(guild_id), "r", encoding="utf-8") as f:
+                content = await f.read()
+                return content.strip()
+        except FileNotFoundError:
+            return ""
+
+async def write_memory(guild_id, content):
+    """Write content to the memory file for a server (async, with lock)."""
+    async with get_memory_lock(guild_id):
+        async with aiofiles.open(get_memory_path(guild_id), "w", encoding="utf-8") as f:
+            await f.write(content)
 
 # Initialize clients
 intents = discord.Intents.default()
 intents.message_content = True
 # intents.members = True  # Uncomment after enabling "Server Members Intent" in Discord Developer Portal
 client = discord.Client(intents=intents)
-anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+anthropic_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 MAX_MESSAGES_CHARS = 2000
 MAX_TOOL_ITERATIONS = 10
@@ -282,11 +380,8 @@ def start_checkin_timer(channel):
         except asyncio.CancelledError:
             return  # Timer was cancelled (user sent a message or new check-in started)
 
-        # Initialize lock for this channel if needed
-        if channel_id not in channel_locks:
-            channel_locks[channel_id] = asyncio.Lock()
-
-        lock = channel_locks[channel_id]
+        # Get or create lock for this channel (atomic to avoid race condition)
+        lock = channel_locks.setdefault(channel_id, asyncio.Lock())
 
         # If channel is busy, skip this check-in
         if lock.locked():
@@ -344,9 +439,9 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
 
         elif name == "memory_append":
             text = input_data["text"]
-            current_memory = read_memory(guild_id)
+            current_memory = await read_memory(guild_id)
             new_memory = current_memory + "\n" + text if current_memory else text
-            write_memory(guild_id, new_memory)
+            await write_memory(guild_id, new_memory)
             if OUTPUT_NON_MESSAGES:
                 await channel.send(f'*used memory_append: "{text}"*')
             return f"Appended to memory."
@@ -354,13 +449,13 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
         elif name == "memory_replace":
             old_text = input_data["old_text"]
             new_text = input_data["new_text"]
-            current_memory = read_memory(guild_id)
+            current_memory = await read_memory(guild_id)
 
             if old_text not in current_memory:
                 return f"Error: Text not found in memory: '{old_text[:50]}...'"
 
             updated_memory = current_memory.replace(old_text, new_text)
-            write_memory(guild_id, updated_memory)
+            await write_memory(guild_id, updated_memory)
             if OUTPUT_NON_MESSAGES:
                 if new_text:
                     await channel.send(f'*used memory_replace: "{old_text}" → "{new_text}"*')
@@ -373,25 +468,28 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
 
         elif name == "read_image_from_url":
             url = input_data["url"]
-            async with httpx.AsyncClient() as http_client:
-                response = await http_client.get(url, follow_redirects=True)
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "image/png")
-                # Extract just the mime type (e.g., "image/png" from "image/png; charset=utf-8")
-                if ";" in content_type:
-                    content_type = content_type.split(";")[0].strip()
-                image_data = base64.b64encode(response.content).decode("utf-8")
-                return [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": content_type,
-                            "data": image_data
-                        }
-                    },
-                    {"type": "text", "text": f"Image from {url}"}
-                ]
+            http_client = get_http_client()
+            response = await http_client.get(url)
+            response.raise_for_status()
+            # Check size limit
+            if len(response.content) > MAX_IMAGE_SIZE:
+                return f"Error: Image too large ({len(response.content) // 1024 // 1024}MB). Max is {MAX_IMAGE_SIZE // 1024 // 1024}MB."
+            content_type = response.headers.get("content-type", "image/png")
+            # Extract just the mime type (e.g., "image/png" from "image/png; charset=utf-8")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            image_data = base64.b64encode(response.content).decode("utf-8")
+            return [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content_type,
+                        "data": image_data
+                    }
+                },
+                {"type": "text", "text": f"Image from {url}"}
+            ]
 
         elif name == "view_custom_emoji":
             emoji_name = input_data["emoji_name"]
@@ -406,24 +504,26 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
 
             # Fetch the emoji image
             emoji_url = str(emoji.url)
-            async with httpx.AsyncClient() as http_client:
-                response = await http_client.get(emoji_url, follow_redirects=True)
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "image/png")
-                if ";" in content_type:
-                    content_type = content_type.split(";")[0].strip()
-                image_data = base64.b64encode(response.content).decode("utf-8")
-                return [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": content_type,
-                            "data": image_data
-                        }
-                    },
-                    {"type": "text", "text": f"Custom emoji :{emoji_name}: (animated: {emoji.animated})"}
-                ]
+            http_client = get_http_client()
+            response = await http_client.get(emoji_url)
+            response.raise_for_status()
+            if len(response.content) > MAX_IMAGE_SIZE:
+                return f"Error: Emoji image too large."
+            content_type = response.headers.get("content-type", "image/png")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            image_data = base64.b64encode(response.content).decode("utf-8")
+            return [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content_type,
+                        "data": image_data
+                    }
+                },
+                {"type": "text", "text": f"Custom emoji :{emoji_name}: (animated: {emoji.animated})"}
+            ]
 
         elif name == "view_sticker":
             sticker_name = input_data["sticker_name"]
@@ -456,28 +556,32 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
 
             # Fetch the sticker image
             sticker_url = str(sticker.url)
-            async with httpx.AsyncClient() as http_client:
-                response = await http_client.get(sticker_url, follow_redirects=True)
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "image/png")
-                if ";" in content_type:
-                    content_type = content_type.split(";")[0].strip()
-                image_data = base64.b64encode(response.content).decode("utf-8")
-                return [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": content_type,
-                            "data": image_data
-                        }
-                    },
-                    {"type": "text", "text": f"Sticker: {sticker_name}"}
-                ]
+            http_client = get_http_client()
+            response = await http_client.get(sticker_url)
+            response.raise_for_status()
+            if len(response.content) > MAX_IMAGE_SIZE:
+                return f"Error: Sticker image too large."
+            content_type = response.headers.get("content-type", "image/png")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            image_data = base64.b64encode(response.content).decode("utf-8")
+            return [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content_type,
+                        "data": image_data
+                    }
+                },
+                {"type": "text", "text": f"Sticker: {sticker_name}"}
+            ]
 
         else:
             return f"Error: Unknown tool '{name}'"
 
+    except asyncio.CancelledError:
+        raise  # Don't swallow task cancellation
     except Exception as e:
         print(f"Error executing {name}: {e}")
         return f"Error executing {name}: {str(e)}"
@@ -554,10 +658,10 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
     server_side_tools = {"web_search", "web_fetch"}
     used_user_facing_tool = False
 
-    def call_claude_api(msgs):
-        """Call Claude API and handle credit errors."""
+    async def call_claude_api(msgs):
+        """Call Claude API and handle credit errors (async)."""
         try:
-            return anthropic_client.messages.create(
+            return await anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
@@ -573,7 +677,7 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
             raise
 
     for iteration in range(MAX_TOOL_ITERATIONS):
-        response = call_claude_api(messages)
+        response = await call_claude_api(messages)
 
         # Collect tool uses from response (both custom and server-side)
         tool_uses = [block for block in response.content if block.type == "tool_use"]
@@ -597,6 +701,9 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
         # Filter to only custom tools that we need to execute (server-side tools are handled automatically by the API)
         custom_tool_uses = [t for t in tool_uses if t.name not in server_side_tools]
 
+        # Track whether we appended to messages this iteration
+        appended_response = False
+
         # If there are custom tools to execute
         if custom_tool_uses:
             tool_results = await execute_tools(custom_tool_uses, channel, guild, index_to_id)
@@ -604,17 +711,21 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
             # Add assistant response and tool results to messages for next iteration
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
+            appended_response = True
         elif server_tool_uses or any(block.type in ("web_search_tool_result", "web_fetch_tool_result") for block in response.content):
             # Server-side tools were used or results returned - add response and continue loop
             messages.append({"role": "assistant", "content": response.content})
+            appended_response = True
 
         # Check if we're done
         if response.stop_reason == "end_turn":
-            messages.append({"role": "assistant", "content": response.content})
+            if not appended_response:
+                messages.append({"role": "assistant", "content": response.content})
             break
         elif response.stop_reason != "tool_use":
             print(f"Unexpected stop_reason: {response.stop_reason}")
-            messages.append({"role": "assistant", "content": response.content})
+            if not appended_response:
+                messages.append({"role": "assistant", "content": response.content})
             break
 
     # If Claude didn't use any user-facing tool, send a reminder and let it try again
@@ -628,7 +739,7 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
         messages.append({"role": "user", "content": reminder})
 
         # Give Claude one more chance
-        response = call_claude_api(messages)
+        response = await call_claude_api(messages)
 
         tool_uses = [block for block in response.content if block.type == "tool_use"]
         custom_tool_uses = [t for t in tool_uses if t.name not in server_side_tools]
@@ -810,10 +921,21 @@ async def process_channel(channel):
 
     context = "\n".join(context_lines)
 
+    # Check rate limit before calling Claude API
+    if not can_make_api_call():
+        # Queue this channel for processing when rate limit clears
+        rate_limit_queue[channel.id] = channel
+        print(f"Rate limited - queued channel {channel.id}, will process in {time_until_rate_limit_clears():.1f}s")
+        await schedule_rate_limit_queue_processing()
+        return
+
+    # Record that we're making an API call
+    record_api_call()
+
     # Build prompt and call Claude API
     current_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
     guild_id = guild.id if guild else "dm"
-    memory = read_memory(guild_id)
+    memory = await read_memory(guild_id)
     user_prompt = build_user_prompt(bot_name, current_time, server_info, channel_info, context, memory)
 
     try:
@@ -865,11 +987,8 @@ async def on_message(message):
         except asyncio.CancelledError:
             return  # Newer message came in, this task was replaced
 
-        # Initialize lock for this channel if needed
-        if channel_id not in channel_locks:
-            channel_locks[channel_id] = asyncio.Lock()
-
-        lock = channel_locks[channel_id]
+        # Get or create lock for this channel (atomic to avoid race condition)
+        lock = channel_locks.setdefault(channel_id, asyncio.Lock())
 
         # Try to acquire the lock without blocking
         if lock.locked():
