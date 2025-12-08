@@ -1,6 +1,4 @@
-# Claude Discord Bot
-
-An ambient Discord bot powered by Claude that participates in conversations naturally.
+An ambient Discord bot powered by Claude!
 
 ## Setup
 
