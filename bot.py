@@ -31,7 +31,7 @@ rate_limit_process_task = None  # Task for processing queued requests when rate 
 # Per-channel check-in mechanism (Claude periodically checks back on the channel)
 channel_checkin_tasks = {}  # channel_id -> asyncio.Task for periodic check-in
 channel_checkin_delay = {}  # channel_id -> current delay in seconds
-CHECKIN_BASE_DELAY = 60  # Initial check-in delay (1 minute)
+CHECKIN_BASE_DELAY = 600  # Initial check-in delay (10 minutes)
 CHECKIN_MULTIPLIER = 10  # Multiply delay by this after each check-in
 
 # Per-guild locks for memory file operations (prevents race conditions)
@@ -296,6 +296,62 @@ TOOLS = [
             },
             "required": ["sticker_name", "message_index"]
         }
+    },
+    {
+        "name": "search_gif",
+        "description": "Search for a GIF using Giphy. Returns a GIF URL that you can send via send_message. Discord will auto-embed the GIF.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for the GIF (e.g., 'happy dance', 'thumbs up', 'cat sleeping')"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "search_messages",
+        "description": "Search for messages in the current channel. Returns up to 5 matching messages. Searches through message content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text to search for in messages (case-insensitive)"
+                },
+                "from_user": {
+                    "type": "string",
+                    "description": "Optional: filter to messages from a specific username"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "pin_message",
+        "description": "Pin a message to the channel. Pinned messages are saved for easy reference. Requires 'Manage Messages' permission.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message_index": {
+                    "type": "integer",
+                    "description": "The index of the message to pin"
+                }
+            },
+            "required": ["message_index"]
+        }
+    },
+    {
+        "name": "get_pinned_messages",
+        "description": "Get all pinned messages in the current channel. Returns the content, author, and timestamp of each pinned message.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "cache_control": {"type": "ephemeral"}
     }
 ]
 
@@ -309,7 +365,7 @@ IMPORTANT: Users can ONLY see your tool calls, NOT your text responses. Any text
 - You must use one or more of these user-facing tools (send_message, add_reaction, or do_nothing).
 
 You have a long-term memory file for this server that you can choose to update.
-When new messages come in, you will see recent conversation, and your long-term memory.
+When new messages come in (sometimes with some delay), you will see recent conversation, and your long-term memory. Sometimes you might have missed a message earlier.
 Try not to exceed 2000 characters of memory in total over time.
 
 Message indices refer to the [N] numbers shown in Recent Messages, where 0 is the most recent message.
@@ -318,7 +374,7 @@ Existing reactions are shown at the end of messages in brackets, e.g. [ðŸ‘x3 â
 
 Feel free to engage however you'd like. You have no particular pre-defined goals here; you can choose your own goals, if you'd like.
 In general, when you're not sure what to do, you could try to mimic the habits / cadence / style of the other members.
-Lastly, you don't have to respond every time - just use do_nothing to not engage.
+Lastly, you don't have to respond every time - if you want to not engage, use do_nothing. But feel free to chat as much as you'd like.
 """
 
 MAX_MEMORY_CHARS = 2000
@@ -578,6 +634,101 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
                 {"type": "text", "text": f"Sticker: {sticker_name}"}
             ]
 
+        elif name == "search_gif":
+            query = input_data["query"]
+            giphy_key = os.getenv("GIPHY_API_KEY")
+            if not giphy_key:
+                return "Error: GIPHY_API_KEY not configured in .env"
+
+            http_client = get_http_client()
+            params = {
+                "api_key": giphy_key,
+                "q": query,
+                "limit": 1,
+                "rating": "g"
+            }
+            response = await http_client.get("https://api.giphy.com/v1/gifs/search", params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get("data"):
+                return f"No GIFs found for query: {query}"
+
+            # Get the GIF URL from the first result
+            gif_url = data["data"][0]["images"]["original"]["url"]
+            return f"Found GIF for '{query}': {gif_url}\n\nUse send_message with this URL to post it."
+
+        elif name == "search_messages":
+            query = input_data["query"].lower()
+            from_user = input_data.get("from_user", "").lower()
+            bot_name = client.user.display_name
+
+            matches = []
+            async for msg in channel.history(limit=500):
+                # Check if content matches query
+                if query not in msg.content.lower():
+                    continue
+
+                # Check from_user filter if specified
+                author_name = bot_name if msg.author == client.user else msg.author.display_name
+                if from_user and from_user not in author_name.lower():
+                    continue
+
+                timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                result = f"[{timestamp}] {author_name}: {msg.content}"
+
+                # Include image attachments if present
+                image_urls = [a.url for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                if image_urls:
+                    result += "\n  [images: " + ", ".join(image_urls) + "]"
+
+                matches.append(result)
+
+                if len(matches) >= 5:
+                    break
+
+            if not matches:
+                return f"No messages found matching '{input_data['query']}'"
+
+            return f"Found {len(matches)} message(s) matching '{input_data['query']}':\n\n" + "\n\n".join(matches)
+
+        elif name == "pin_message":
+            msg_index = input_data["message_index"]
+
+            if msg_index not in index_to_id:
+                return f"Error: Invalid message index {msg_index}. Valid range: 0-{len(index_to_id)-1}"
+
+            real_msg_id = index_to_id[msg_index]
+            target_msg = await channel.fetch_message(real_msg_id)
+            await target_msg.pin()
+            return f"Pinned message {msg_index}."
+
+        elif name == "get_pinned_messages":
+            bot_name = client.user.display_name
+            pinned = await channel.pins()
+
+            if not pinned:
+                return "No pinned messages in this channel."
+
+            # Limit to last 10 pinned messages
+            pinned = pinned[:10]
+
+            results = []
+            for msg in pinned:
+                author_name = bot_name if msg.author == client.user else msg.author.display_name
+                timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                result = f"[{timestamp}] {author_name}: {content}"
+
+                # Include image attachments if present
+                image_urls = [a.url for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                if image_urls:
+                    result += "\n  [images: " + ", ".join(image_urls) + "]"
+
+                results.append(result)
+
+            return f"Showing {len(results)} most recent pinned message(s):\n\n" + "\n\n".join(results)
+
         else:
             return f"Error: Unknown tool '{name}'"
 
@@ -665,10 +816,10 @@ async def handle_claude_response(user_prompt, channel, guild, index_to_id):
             return await anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
+                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
                 tools=TOOLS,
                 messages=msgs,
-                extra_headers={"anthropic-beta": "web-fetch-2025-09-10"}
+                extra_headers={"anthropic-beta": "web-fetch-2025-09-10,prompt-caching-2024-07-31"}
             )
         except anthropic.APIStatusError as e:
             # Check for credit/billing/usage limit related errors
@@ -785,7 +936,7 @@ async def process_channel(channel):
 
     async for msg in channel.history(limit=50):
         author_name = bot_name if msg.author == client.user else msg.author.display_name
-        timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+        timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
         # Collect reactions as "emoji xN" format
         reactions = []
         for reaction in msg.reactions:
@@ -794,17 +945,41 @@ async def process_channel(channel):
                 reactions.append(f"{emoji_str}x{reaction.count}")
             else:
                 reactions.append(emoji_str)
+        # Convert user mentions from <@id> to @username format
+        content = msg.content
+        for mentioned_user in msg.mentions:
+            mention_name = bot_name if mentioned_user == client.user else mentioned_user.display_name
+            # Replace both <@id> and <@!id> formats (the latter is for nicknames)
+            content = content.replace(f"<@{mentioned_user.id}>", f"@{mention_name}")
+            content = content.replace(f"<@!{mentioned_user.id}>", f"@{mention_name}")
+        # Extract embed content
+        embeds_data = []
+        for embed in msg.embeds:
+            embed_parts = []
+            if embed.title:
+                embed_parts.append(f"Title: {embed.title}")
+            if embed.description:
+                embed_parts.append(f"Description: {embed.description}")
+            if embed.fields:
+                for field in embed.fields:
+                    embed_parts.append(f"{field.name}: {field.value}")
+            if embed.footer and embed.footer.text:
+                embed_parts.append(f"Footer: {embed.footer.text}")
+            if embed_parts:
+                embeds_data.append(" | ".join(embed_parts))
+
         msg_data = {
             'id': msg.id,
             'author': author_name,
             'timestamp': timestamp,
-            'content': msg.content,
+            'content': content,
             'reply_to_id': msg.reference.message_id if msg.reference else None,
             'reactions': reactions,
             'attachments': [{'filename': a.filename, 'url': a.url, 'content_type': a.content_type}
                            for a in msg.attachments],
             'stickers': [{'name': s.name, 'id': s.id, 'url': str(s.url), 'format': str(s.format)}
-                        for s in msg.stickers]
+                        for s in msg.stickers],
+            'embeds': embeds_data
         }
         all_messages.append(msg_data)
         messages_by_id[msg.id] = msg_data
@@ -845,7 +1020,7 @@ async def process_channel(channel):
             try:
                 ref_msg = await channel.fetch_message(ref_id)
                 author_name = bot_name if ref_msg.author == client.user else ref_msg.author.display_name
-                timestamp = ref_msg.created_at.strftime("%Y-%m-%d %H:%M")
+                timestamp = ref_msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
                 reactions = []
                 for reaction in ref_msg.reactions:
                     emoji_str = str(reaction.emoji)
@@ -853,6 +1028,22 @@ async def process_channel(channel):
                         reactions.append(f"{emoji_str}x{reaction.count}")
                     else:
                         reactions.append(emoji_str)
+                # Extract embed content for referenced message
+                ref_embeds_data = []
+                for embed in ref_msg.embeds:
+                    embed_parts = []
+                    if embed.title:
+                        embed_parts.append(f"Title: {embed.title}")
+                    if embed.description:
+                        embed_parts.append(f"Description: {embed.description}")
+                    if embed.fields:
+                        for field in embed.fields:
+                            embed_parts.append(f"{field.name}: {field.value}")
+                    if embed.footer and embed.footer.text:
+                        embed_parts.append(f"Footer: {embed.footer.text}")
+                    if embed_parts:
+                        ref_embeds_data.append(" | ".join(embed_parts))
+
                 referenced_messages.append({
                     'id': ref_msg.id,
                     'author': author_name,
@@ -863,7 +1054,8 @@ async def process_channel(channel):
                     'attachments': [{'filename': a.filename, 'url': a.url, 'content_type': a.content_type}
                                    for a in ref_msg.attachments],
                     'stickers': [{'name': s.name, 'id': s.id, 'url': str(s.url), 'format': str(s.format)}
-                                for s in ref_msg.stickers]
+                                for s in ref_msg.stickers],
+                    'embeds': ref_embeds_data
                 })
             except Exception as e:
                 print(f"Could not fetch referenced message {ref_id}: {e}")
@@ -875,8 +1067,34 @@ async def process_channel(channel):
         id_to_index[ref_msg['id']] = next_index
         next_index += 1
 
-    # Build context lines (reversed so oldest appears first in display, but indices stay same)
+    # Build context lines - start with referenced messages (older context) if any
     context_lines = []
+    if referenced_messages:
+        context_lines.append("--- Referenced messages (older, pulled into context) ---")
+        for ref_msg in referenced_messages:
+            idx = id_to_index[ref_msg['id']]
+            reply_part = ""
+            if ref_msg['reply_to_id'] and ref_msg['reply_to_id'] in id_to_index:
+                reply_part = f" [replying to {id_to_index[ref_msg['reply_to_id']]}]"
+            reactions_part = ""
+            if ref_msg.get('reactions'):
+                reactions_part = f" [{' '.join(ref_msg['reactions'])}]"
+            attachments_part = ""
+            if ref_msg.get('attachments'):
+                att_strs = [f"{a['filename']}: {a['url']}" for a in ref_msg['attachments']]
+                attachments_part = " [attachments: " + ", ".join(att_strs) + "]"
+            stickers_part = ""
+            if ref_msg.get('stickers'):
+                sticker_strs = [s['name'] for s in ref_msg['stickers']]
+                stickers_part = " [stickers: " + ", ".join(sticker_strs) + "]"
+            embeds_part = ""
+            if ref_msg.get('embeds'):
+                embeds_part = " [embeds: " + " || ".join(ref_msg['embeds']) + "]"
+            context_lines.append(f"[{idx}] {ref_msg['author']} ({ref_msg['timestamp']}){reply_part}: {ref_msg['content']}{reactions_part}{attachments_part}{stickers_part}{embeds_part}")
+        context_lines.append("")  # Blank line separator
+
+    # Add recent messages (reversed so oldest appears first in display, but indices stay same)
+    context_lines.append("--- Recent messages ---")
     for i in range(len(messages_to_include) - 1, -1, -1):
         msg = messages_to_include[i]
         reply_part = ""
@@ -897,28 +1115,10 @@ async def process_channel(channel):
         if msg.get('stickers'):
             sticker_strs = [s['name'] for s in msg['stickers']]
             stickers_part = " [stickers: " + ", ".join(sticker_strs) + "]"
-        context_lines.append(f"[{i}] {msg['author']} ({msg['timestamp']}){reply_part}: {msg['content']}{reactions_part}{attachments_part}{stickers_part}")
-
-    # Add referenced messages section if any
-    if referenced_messages:
-        context_lines.append("\n--- Referenced messages (older, pulled into context) ---")
-        for ref_msg in referenced_messages:
-            idx = id_to_index[ref_msg['id']]
-            reply_part = ""
-            if ref_msg['reply_to_id'] and ref_msg['reply_to_id'] in id_to_index:
-                reply_part = f" [replying to {id_to_index[ref_msg['reply_to_id']]}]"
-            reactions_part = ""
-            if ref_msg.get('reactions'):
-                reactions_part = f" [{' '.join(ref_msg['reactions'])}]"
-            attachments_part = ""
-            if ref_msg.get('attachments'):
-                att_strs = [f"{a['filename']}: {a['url']}" for a in ref_msg['attachments']]
-                attachments_part = " [attachments: " + ", ".join(att_strs) + "]"
-            stickers_part = ""
-            if ref_msg.get('stickers'):
-                sticker_strs = [s['name'] for s in ref_msg['stickers']]
-                stickers_part = " [stickers: " + ", ".join(sticker_strs) + "]"
-            context_lines.append(f"[{idx}] {ref_msg['author']} ({ref_msg['timestamp']}){reply_part}: {ref_msg['content']}{reactions_part}{attachments_part}{stickers_part}")
+        embeds_part = ""
+        if msg.get('embeds'):
+            embeds_part = " [embeds: " + " || ".join(msg['embeds']) + "]"
+        context_lines.append(f"[{i}] {msg['author']} ({msg['timestamp']}){reply_part}: {msg['content']}{reactions_part}{attachments_part}{stickers_part}{embeds_part}")
 
     context = "\n".join(context_lines)
 
