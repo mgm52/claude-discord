@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import base64
+import re
 import aiofiles
 import httpx
 from datetime import datetime
@@ -191,7 +192,7 @@ TOOLS = [
             "properties": {
                 "emoji": {
                     "type": "string",
-                    "description": "(e.g., '👍', '❤️', '🔥')"
+                    "description": "Unicode emoji (e.g., '👍', '❤️') or custom emoji name (e.g., 'peak_cat', 'Claude_Think')"
                 },
                 "message_index": {
                     "type": "integer",
@@ -253,7 +254,7 @@ TOOLS = [
     },
     {
         "name": "read_image_from_url",
-        "description": "Fetch and view an image from a URL. Use this to see images that were shared in the chat (shown in [attachments: ...]). Note: viewing images is costly, so use sparingly.",
+        "description": "Fetch and view an image from a URL. Use this to see images that were shared in the chat (shown in [attachments: ...] or in [embeds: ... Images: ...]). Note: viewing images is costly, so use sparingly.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -362,10 +363,11 @@ IMPORTANT: Users can ONLY see your tool calls, NOT your text responses. Any text
 -- Try to use show_typing right away if you plan to send a message, to indicate you're working on it.
 - To react: use add_reaction
 - To stay silent: use do_nothing
-- You must use one or more of these user-facing tools (send_message, add_reaction, or do_nothing).
+- You must use one or more of these user-facing tools (send_message, add_reaction, or do_nothing). It's okay to write multiple messages in a row if you'd like.
 
 You have a long-term memory file for this server that you can choose to update.
-When new messages come in (sometimes with some delay), you will see recent conversation, and your long-term memory. Sometimes you might have missed a message earlier.
+When new messages come in (they may arrive to you in batches), you will see recent conversation, and your long-term memory.
+Sometimes you might have missed a message earlier -- it's not always just about responding to the most immediate recent message.
 Try not to exceed 2000 characters of memory in total over time.
 
 Message indices refer to the [N] numbers shown in Recent Messages, where 0 is the most recent message.
@@ -475,15 +477,13 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
                 real_msg_id = index_to_id[reply_to_index]
                 target_msg = await channel.fetch_message(real_msg_id)
                 await target_msg.reply(content)
-                start_checkin_timer(channel)
                 return f"Sent reply to message {reply_to_index}."
             else:
                 await channel.send(content)
-                start_checkin_timer(channel)
                 return "Message sent."
 
         elif name == "add_reaction":
-            emoji = input_data["emoji"]
+            emoji_input = input_data["emoji"]
             msg_index = input_data["message_index"]
 
             if msg_index not in index_to_id:
@@ -491,8 +491,17 @@ async def execute_single_tool(tool, channel, guild, index_to_id):
 
             real_msg_id = index_to_id[msg_index]
             target_msg = await channel.fetch_message(real_msg_id)
-            await target_msg.add_reaction(emoji)
-            return f"Added reaction {emoji} to message {msg_index}."
+
+            # Check if it's a custom emoji name (alphanumeric/underscore only, no unicode)
+            emoji_to_use = emoji_input
+            if guild and re.match(r'^[\w]+$', emoji_input) and not any(ord(c) > 127 for c in emoji_input):
+                # Try to find custom emoji by name
+                custom_emoji = discord.utils.get(guild.emojis, name=emoji_input)
+                if custom_emoji:
+                    emoji_to_use = custom_emoji
+
+            await target_msg.add_reaction(emoji_to_use)
+            return f"Added reaction {emoji_input} to message {msg_index}."
 
         elif name == "memory_append":
             text = input_data["text"]
@@ -952,6 +961,8 @@ async def process_channel(channel):
             # Replace both <@id> and <@!id> formats (the latter is for nicknames)
             content = content.replace(f"<@{mentioned_user.id}>", f"@{mention_name}")
             content = content.replace(f"<@!{mentioned_user.id}>", f"@{mention_name}")
+        # Convert custom emojis from <:name:id> and <a:name:id> to readable format
+        content = re.sub(r'<a?:(\w+):\d+>', r':\1:', content)
         # Extract embed content
         embeds_data = []
         for embed in msg.embeds:
@@ -965,6 +976,14 @@ async def process_channel(channel):
                     embed_parts.append(f"{field.name}: {field.value}")
             if embed.footer and embed.footer.text:
                 embed_parts.append(f"Footer: {embed.footer.text}")
+            # Include image URLs from embeds
+            embed_images = []
+            if embed.image and embed.image.url:
+                embed_images.append(embed.image.url)
+            if embed.thumbnail and embed.thumbnail.url:
+                embed_images.append(embed.thumbnail.url)
+            if embed_images:
+                embed_parts.append(f"Images: {', '.join(embed_images)}")
             if embed_parts:
                 embeds_data.append(" | ".join(embed_parts))
 
@@ -1028,6 +1047,9 @@ async def process_channel(channel):
                         reactions.append(f"{emoji_str}x{reaction.count}")
                     else:
                         reactions.append(emoji_str)
+                # Convert custom emojis in referenced message
+                ref_content = ref_msg.content
+                ref_content = re.sub(r'<a?:(\w+):\d+>', r':\1:', ref_content)
                 # Extract embed content for referenced message
                 ref_embeds_data = []
                 for embed in ref_msg.embeds:
@@ -1041,6 +1063,14 @@ async def process_channel(channel):
                             embed_parts.append(f"{field.name}: {field.value}")
                     if embed.footer and embed.footer.text:
                         embed_parts.append(f"Footer: {embed.footer.text}")
+                    # Include image URLs from embeds
+                    embed_images = []
+                    if embed.image and embed.image.url:
+                        embed_images.append(embed.image.url)
+                    if embed.thumbnail and embed.thumbnail.url:
+                        embed_images.append(embed.thumbnail.url)
+                    if embed_images:
+                        embed_parts.append(f"Images: {', '.join(embed_images)}")
                     if embed_parts:
                         ref_embeds_data.append(" | ".join(embed_parts))
 
@@ -1048,7 +1078,7 @@ async def process_channel(channel):
                     'id': ref_msg.id,
                     'author': author_name,
                     'timestamp': timestamp,
-                    'content': ref_msg.content,
+                    'content': ref_content,
                     'reply_to_id': ref_msg.reference.message_id if ref_msg.reference else None,
                     'reactions': reactions,
                     'attachments': [{'filename': a.filename, 'url': a.url, 'content_type': a.content_type}
@@ -1157,6 +1187,9 @@ async def process_channel(channel):
         # Write full error to file for debugging
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(error_msg)
+
+    # Start check-in timer after any Claude response (sends, reactions, or do_nothing)
+    start_checkin_timer(channel)
 
 
 @client.event

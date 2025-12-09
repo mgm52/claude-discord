@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 ignoreREADME.txt
+error_log.txt
+latest_conversation.txt
+memory/
+.claude/
